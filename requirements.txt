@@ -1,6 +1,6 @@
 fastapi
-uvicorn
-python-multipart
-pdf2image
+uvicorn[standard]
+pymupdf
 pytesseract
-pdfplumber
+pillow
+python-multipart
