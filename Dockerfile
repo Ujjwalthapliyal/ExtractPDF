@@ -1,10 +1,11 @@
 FROM python:3.10-slim
 
-# Install system dependencies required for PDF rasterization & OCR
-RUN apt-get update && apt-get install -y \
+# System dependencies: tesseract for OCR (this code uses fitz/PyMuPDF for
+# rendering, NOT poppler-utils/pdf2image, so poppler isn't needed here)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
-    poppler-utils \
-    libtesseract-dev \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -12,6 +13,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY main.py .
+
+EXPOSE 10000
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
