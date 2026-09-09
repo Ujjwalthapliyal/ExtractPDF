@@ -1,12 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-import fitz  # PyMuPDF
+import fitz
 import pytesseract
 from PIL import Image
 import gc
 import logging
 import shutil
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+from enum import Enum
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
@@ -15,10 +17,19 @@ logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=1)
 
 TESSERACT_CONFIG = "--oem 3 --psm 6"
-ZOOM = 1.4  # ~100 DPI scale factor (1.4 * 72 DPI), keeps RAM extremely low
-
+ZOOM = 1.4
 MAX_SIZE_MB = 50
-MAX_PAGES = 10
+MAX_PAGES = 100
+
+# In-memory job store (fine for single-instance deploys; use Redis if you scale to multiple instances)
+jobs = {}
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    DONE = "done"
+    FAILED = "failed"
 
 
 @app.on_event("startup")
@@ -45,27 +56,20 @@ def process_pdf(contents: bytes) -> str:
 
         for page_num in range(len(doc)):
             page = doc[page_num]
-
-            # 1. Fast-track: Check if page already has digital text (0.01s execution)
             text = page.get_text().strip()
             if len(text) > 30:
                 extracted_text.append(text)
                 continue
 
-            # 2. Fallback to OCR only if the page is a scanned image
             pix = page.get_pixmap(matrix=mat, alpha=False)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
             try:
                 ocr_text = pytesseract.image_to_string(img, config=TESSERACT_CONFIG)
             except pytesseract.TesseractNotFoundError:
-                raise RuntimeError(
-                    "Tesseract is not installed or not on PATH on this server"
-                )
+                raise RuntimeError("Tesseract is not installed or not on PATH on this server")
 
             extracted_text.append(ocr_text)
-
-            # Release image memory immediately per page
             del pix, img
 
         return "\n\n".join(extracted_text)
@@ -74,8 +78,23 @@ def process_pdf(contents: bytes) -> str:
         gc.collect()
 
 
+def run_job(job_id: str, contents: bytes):
+    jobs[job_id]["status"] = JobStatus.PROCESSING
+    try:
+        text = process_pdf(contents)
+        jobs[job_id]["status"] = JobStatus.DONE
+        jobs[job_id]["result"] = text
+    except ValueError as e:
+        jobs[job_id]["status"] = JobStatus.FAILED
+        jobs[job_id]["error"] = str(e)
+    except Exception as e:
+        logger.error(f"OCR job {job_id} failed: {e}")
+        jobs[job_id]["status"] = JobStatus.FAILED
+        jobs[job_id]["error"] = f"OCR processing failed: {str(e)}"
+
+
 @app.post("/ocr")
-async def extract_pdf_text(file: UploadFile = File(...)):
+async def submit_ocr(file: UploadFile = File(...)):
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="File must be a PDF")
 
@@ -90,18 +109,22 @@ async def extract_pdf_text(file: UploadFile = File(...)):
             detail=f"File too large ({size_mb:.1f} MB); limit is {MAX_SIZE_MB} MB",
         )
 
-    loop = asyncio.get_running_loop()
-    try:
-        text = await loop.run_in_executor(executor, process_pdf, contents)
-    except ValueError as e:
-        # Bad/oversized PDF - client error
-        raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        # Server misconfiguration (e.g. tesseract missing)
-        logger.error(f"OCR configuration error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error(f"OCR failed: {e}")
-        raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": JobStatus.PENDING, "result": None, "error": None}
 
-    return {"text": text}
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(executor, run_job, job_id, contents)
+
+    return {"job_id": job_id, "status": JobStatus.PENDING}
+
+
+@app.get("/ocr/{job_id}")
+async def get_ocr_result(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job["status"] == JobStatus.FAILED:
+        raise HTTPException(status_code=422 if "limit" in (job["error"] or "") else 500, detail=job["error"])
+
+    return {"status": job["status"], "text": job.get("result")}
