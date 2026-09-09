@@ -17,8 +17,8 @@ executor = ThreadPoolExecutor(max_workers=1)
 TESSERACT_CONFIG = "--oem 3 --psm 6"
 ZOOM = 1.4  # ~100 DPI scale factor (1.4 * 72 DPI), keeps RAM extremely low
 
-MAX_SIZE_MB = 20
-MAX_PAGES = 50
+MAX_SIZE_MB = 50
+MAX_PAGES = 10
 
 
 @app.on_event("startup")
