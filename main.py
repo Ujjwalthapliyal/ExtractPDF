@@ -6,6 +6,8 @@ import gc
 import logging
 import shutil
 import uuid
+import sqlite3
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from enum import Enum
@@ -21,8 +23,7 @@ ZOOM = 1.4
 MAX_SIZE_MB = 50
 MAX_PAGES = 100
 
-# In-memory job store (fine for single-instance deploys; use Redis if you scale to multiple instances)
-jobs = {}
+DB_PATH = "jobs.db"
 
 
 class JobStatus(str, Enum):
@@ -32,8 +33,65 @@ class JobStatus(str, Enum):
     FAILED = "failed"
 
 
+# ---------- Job storage (SQLite instead of in-memory dict) ----------
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            result TEXT,
+            error TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def create_job(job_id: str):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO jobs (job_id, status, result, error) VALUES (?, ?, ?, ?)",
+            (job_id, JobStatus.PENDING.value, None, None),
+        )
+        conn.commit()
+
+
+def update_job(job_id: str, status: str, result: str = None, error: str = None):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = ?, result = ?, error = ? WHERE job_id = ?",
+            (status, result, error, job_id),
+        )
+        conn.commit()
+
+
+def get_job(job_id: str):
+    with get_db() as conn:
+        cur = conn.execute(
+            "SELECT status, result, error FROM jobs WHERE job_id = ?", (job_id,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"status": row[0], "result": row[1], "error": row[2]}
+
+
+# ---------- Startup ----------
+
 @app.on_event("startup")
-async def check_tesseract_installed():
+async def startup_event():
+    init_db()
     if shutil.which("tesseract") is None:
         logger.error("Tesseract binary not found on PATH. OCR requests will fail.")
     else:
@@ -44,6 +102,8 @@ async def check_tesseract_installed():
 async def health():
     return {"status": "ok"}
 
+
+# ---------- Core OCR logic ----------
 
 def process_pdf(contents: bytes) -> str:
     doc = fitz.open(stream=contents, filetype="pdf")
@@ -79,19 +139,18 @@ def process_pdf(contents: bytes) -> str:
 
 
 def run_job(job_id: str, contents: bytes):
-    jobs[job_id]["status"] = JobStatus.PROCESSING
+    update_job(job_id, JobStatus.PROCESSING.value)
     try:
         text = process_pdf(contents)
-        jobs[job_id]["status"] = JobStatus.DONE
-        jobs[job_id]["result"] = text
+        update_job(job_id, JobStatus.DONE.value, result=text)
     except ValueError as e:
-        jobs[job_id]["status"] = JobStatus.FAILED
-        jobs[job_id]["error"] = str(e)
+        update_job(job_id, JobStatus.FAILED.value, error=str(e))
     except Exception as e:
         logger.error(f"OCR job {job_id} failed: {e}")
-        jobs[job_id]["status"] = JobStatus.FAILED
-        jobs[job_id]["error"] = f"OCR processing failed: {str(e)}"
+        update_job(job_id, JobStatus.FAILED.value, error=f"OCR processing failed: {str(e)}")
 
+
+# ---------- Routes ----------
 
 @app.post("/ocr")
 async def submit_ocr(file: UploadFile = File(...)):
@@ -110,7 +169,7 @@ async def submit_ocr(file: UploadFile = File(...)):
         )
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": JobStatus.PENDING, "result": None, "error": None}
+    create_job(job_id)
 
     loop = asyncio.get_running_loop()
     loop.run_in_executor(executor, run_job, job_id, contents)
@@ -120,11 +179,14 @@ async def submit_ocr(file: UploadFile = File(...)):
 
 @app.get("/ocr/{job_id}")
 async def get_ocr_result(job_id: str):
-    job = jobs.get(job_id)
+    job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job["status"] == JobStatus.FAILED:
-        raise HTTPException(status_code=422 if "limit" in (job["error"] or "") else 500, detail=job["error"])
+    if job["status"] == JobStatus.FAILED.value:
+        raise HTTPException(
+            status_code=422 if "limit" in (job["error"] or "") else 500,
+            detail=job["error"],
+        )
 
     return {"status": job["status"], "text": job.get("result")}
