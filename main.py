@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from pdf2image import convert_from_bytes, pdfinfo_from_bytes
+import fitz  # PyMuPDF
 import pytesseract
+from PIL import Image
 import gc
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 executor = ThreadPoolExecutor(max_workers=1)
 
 TESSERACT_CONFIG = "--oem 3 --psm 6"
-DPI = 100  # lower DPI = less memory per page
+ZOOM = 1.4  # ~100 DPI scale factor (1.4 * 72 DPI), keeps RAM extremely low
 
 
 @app.get("/health")
@@ -22,29 +23,35 @@ async def health():
 
 
 def process_pdf(contents: bytes) -> str:
-    # Get page count without rendering anything yet (cheap, low memory)
-    info = pdfinfo_from_bytes(contents)
-    total_pages = info["Pages"]
+    # Open document once in C-bindings memory (no re-parsing per page)
+    doc = fitz.open(stream=contents, filetype="pdf")
+    extracted_text = []
 
-    extracted_text = ""
-    for page_num in range(1, total_pages + 1):
-        # Render ONLY this one page
-        images = convert_from_bytes(
-            contents,
-            dpi=DPI,
-            first_page=page_num,
-            last_page=page_num,
-        )
-        img = images[0]
-        text = pytesseract.image_to_string(img, config=TESSERACT_CONFIG)
-        extracted_text += text + "\n"
+    # Resolution matrix for lower memory rendering
+    mat = fitz.Matrix(ZOOM, ZOOM)
 
-        # explicitly release memory before moving to next page
-        del img
-        del images
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+
+        # 1. Fast-track: Check if page already has digital text (0.01s execution)
+        text = page.get_text().strip()
+        if len(text) > 30:
+            extracted_text.append(text)
+            continue
+
+        # 2. Fallback to OCR only if the page is a scanned image
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        ocr_text = pytesseract.image_to_string(img, config=TESSERACT_CONFIG)
+        extracted_text.append(ocr_text)
+
+        # Release image memory immediately per page
+        del pix, img
         gc.collect()
 
-    return extracted_text
+    doc.close()
+    return "\n\n".join(extracted_text)
 
 
 @app.post("/ocr")
@@ -61,6 +68,8 @@ async def extract_pdf_text(file: UploadFile = File(...)):
         text = await loop.run_in_executor(executor, process_pdf, contents)
     except Exception as e:
         logger.error(f"OCR failed: {e}")
-        raise HTTPException(status_code=500, detail=f"OCR processing failed: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"OCR processing failed: {str(e)}"
+        )
 
     return {"text": text}
