@@ -3,3 +3,4 @@ uvicorn
 python-multipart
 pdf2image
 pytesseract
+pdfplumber
