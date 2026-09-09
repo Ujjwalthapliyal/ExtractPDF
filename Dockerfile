@@ -14,7 +14,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Sensible defaults for a CPU-bound OCR service on limited resources.
-# --workers 1: avoid multiple heavy OCR processes competing for the same limited CPU/RAM (esp. on Render free tier)
-# --timeout-keep-alive: give slow OCR requests room before the connection is dropped
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000", "--workers", "1", "--timeout-keep-alive", "120"]
